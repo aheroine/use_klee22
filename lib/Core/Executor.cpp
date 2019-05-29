@@ -109,6 +109,8 @@
 #include <cxxabi.h>
 #include <errno.h>
 
+#include <fstream>
+
 using namespace llvm;
 using namespace klee;
 using namespace klee::expr;
@@ -120,6 +122,10 @@ cl::opt<std::string> TargetFunction("target-function",
 
 cl::opt<std::string> FileLists(
     "pcs", cl::desc("A list of path constraints filepath separated by comma"));
+
+cl::opt<std::string>
+    ErrorFiles("error_files",
+               cl::desc("A list of callstack filepath separated by comma"));
 
 cl::opt<bool> DumpStatesOnHalt(
     "dump-states-on-halt", cl::init(true),
@@ -1240,6 +1246,7 @@ void Executor::stepInstruction(ExecutionState &state) {
 void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
                            std::vector<ref<Expr> > &arguments) {
   Instruction *i = ki->inst;
+  ki->inst->dump();
   if (f && f->isDeclaration()) {
     switch (f->getIntrinsicID()) {
     case Intrinsic::not_intrinsic:
@@ -1317,6 +1324,11 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
         std::string::size_type i = 0;
         std::string::size_type j = s.find(c);
 
+        if (j == std::string::npos) {
+          v.push_back(s);
+          return;
+        }
+
         while (j != std::string::npos) {
           v.push_back(s.substr(i, j - i));
           i = ++j;
@@ -1330,13 +1342,32 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
       std::vector<std::string> res;
       split(FileLists, ',', res);
 
+      std::vector<std::string> stack_files;
+      split(ErrorFiles, ',', stack_files);
+
+      auto cnt = 0;
       for (auto &filename : res) {
+        llvm::errs() << "-----------pc " << cnt << "\n";
+        llvm::errs() << filename << "\n";
+
+        // cnt += 1;
         OwningPtr<MemoryBuffer> MBResult;
-        MemoryBuffer::getFileOrSTDIN(filename, MBResult);
+        error_code ec = MemoryBuffer::getFileOrSTDIN(filename, MBResult);
+
+        if (ec) {
+          continue;
+        }
+
+        std::ifstream infile(stack_files[cnt++]);
+        std::string error_type, line;
+        if (infile.is_open()) {
+          std::getline(infile, error_type);
+        }
 
         ExecutionState fakeState(state);
 
         ExprBuilder *Builder = 0;
+        Builder = createDefaultExprBuilder();
         Builder = createConstantFoldingExprBuilder(Builder);
         Builder = createSimplifyingExprBuilder(Builder);
 
@@ -1383,16 +1414,49 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
         }
         solver->setTimeout(coreSolverTimeout);
         bool mustBeTrue;
-        bool success = solver->mustBeTrue(fakeState, summary, mustBeTrue);
-        if (!success) {
 
+        bool success = solver->mustBeTrue(fakeState, summary, mustBeTrue);
+
+        if (!success) {
+          llvm::errs() << "-----------------------------------solver failed!\n";
         } else {
+          if (!mustBeTrue) {
+            delete P;
+            continue;
+          }
           fakeState.addConstraint(summary);
-          interpreterHandler->processTestCase(fakeState, "summary", "user");
+
+          std::string message;
+          Instruction *lastInst;
+          const InstructionInfo &ii =
+              getLastNonKleeInternalInstruction(state, &lastInst);
+
+          std::string MsgString;
+          llvm::raw_string_ostream msg(MsgString);
+          msg << error_type << "\n";
+          if (ii.file != "") {
+            msg << "File: " << ii.file << "\n";
+            msg << "Line: " << ii.line << "\n";
+            msg << "assembly.ll line: " << ii.assemblyLine << "\n";
+          }
+          msg << "Stack: \n";
+
+          while (std::getline(infile, line)) {
+            msg << line << "\n";
+          }
+
+          infile.close();
+
+          state.dumpStack(msg);
+
+          interpreterHandler->processTestCase(state, msg.str().c_str(),
+                                              "macke.err");
         }
+
+        delete P;
       }
 
-      return;
+      // return;
     }
 
     state.pushFrame(state.prevPC, kf);
@@ -1434,8 +1498,8 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
           size += Expr::getMinBytesForWidth(arguments[i]->getWidth());
         } else {
           Expr::Width argWidth = arguments[i]->getWidth();
-          // AMD64-ABI 3.5.7p5: Step 7. Align l->overflow_arg_area upwards to a
-          // 16 byte boundary if alignment needed by type exceeds 8 byte
+          // AMD64-ABI 3.5.7p5: Step 7. Align l->overflow_arg_area upwards to
+          // a 16 byte boundary if alignment needed by type exceeds 8 byte
           // boundary.
           //
           // Alignment requirements for scalar types is the same as their size
@@ -1466,8 +1530,9 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
         ObjectState *os = bindObjectInState(state, mo, true);
         unsigned offset = 0;
         for (unsigned i = funcArgs; i < callingArgs; i++) {
-          // FIXME: This is really specific to the architecture, not the pointer
-          // size. This happens to work for x86-32 and x86-64, however.
+          // FIXME: This is really specific to the architecture, not the
+          // pointer size. This happens to work for x86-32 and x86-64,
+          // however.
           if (WordSize == Expr::Int32) {
             os->write(offset, arguments[i]);
             offset += Expr::getMinBytesForWidth(arguments[i]->getWidth());
@@ -1524,8 +1589,8 @@ void Executor::printFileLine(ExecutionState &state, KInstruction *ki,
     debugFile << "     [no debug info]:";
 }
 
-/// Compute the true target of a function call, resolving LLVM and KLEE aliases
-/// and bitcasts.
+/// Compute the true target of a function call, resolving LLVM and KLEE
+/// aliases and bitcasts.
 Function *Executor::getTargetFunction(Value *calledVal, ExecutionState &state) {
   SmallPtrSet<const GlobalValue *, 3> Visited;
 
@@ -1584,7 +1649,7 @@ static inline const llvm::fltSemantics *fpWidthToSemantics(unsigned width) {
 void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   Instruction *i = ki->inst;
 
-  ki->inst->dump();
+  // ki->inst->dump();
 
   switch (i->getOpcode()) {
     // Control flow
@@ -1727,7 +1792,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       // Handle possible different branch targets
 
       // We have the following assumptions:
-      // - each case value is mutual exclusive to all other values including the
+      // - each case value is mutual exclusive to all other values including
+      // the
       //   default value
       // - order of case branches is based on the order of the expressions of
       //   the scase values, still default is handled last
@@ -1764,7 +1830,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
            it != itE; ++it) {
         ref<Expr> match = EqExpr::create(cond, it->first);
 
-        // Make sure that the default value does not contain this target's value
+        // Make sure that the default value does not contain this target's
+        // value
         defaultValue = AndExpr::create(defaultValue, Expr::createIsZero(match));
 
         // Check if control flow could take this case
@@ -1775,11 +1842,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         if (result) {
           BasicBlock *caseSuccessor = it->second;
 
-          // Handle the case that a basic block might be the target of multiple
-          // switch cases.
-          // Currently we generate an expression containing all switch-case
-          // values for the same target basic block. We spare us forking too
-          // many times but we generate more complex condition expressions
+          // Handle the case that a basic block might be the target of
+          // multiple switch cases. Currently we generate an expression
+          // containing all switch-case values for the same target basic
+          // block. We spare us forking too many times but we generate more
+          // complex condition expressions
           // TODO Add option to allow to choose between those behaviors
           std::pair<std::map<BasicBlock *, ref<Expr> >::iterator, bool> res =
               branchTargets.insert(std::make_pair(
@@ -2507,7 +2574,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
     bool Result = false;
     switch (fi->getPredicate()) {
-      // Predicates which only care about whether or not the operands are NaNs.
+      // Predicates which only care about whether or not the operands are
+      // NaNs.
     case FCmpInst::FCMP_ORD:
       Result = CmpRes != APFloat::cmpUnordered;
       break;

@@ -59,7 +59,7 @@ bool TimingSolver::mustBeTrue(const ExecutionState& state, ref<Expr> expr,
 
   if (simplifyExprs)
     expr = state.constraints.simplifyExpr(expr);
-
+llvm::errs()<<"\n--------\n"<<expr<<"\n";
   bool success = solver->mustBeTrue(Query(state.constraints, expr), result);
 
   sys::TimeValue delta = util::getWallTimeVal();
